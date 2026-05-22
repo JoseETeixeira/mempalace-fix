@@ -3,16 +3,25 @@
 Status and other read-mostly commands invoke :func:`auto_fix_palace` so the
 operator does not have to run individual repair sub-commands by hand when
 the fix is fast, well-understood, and reversible (we always take a sqlite
-backup before mutating). Heavy rebuilds (full HNSW reindex) are deliberately
-out of scope — those still go through ``mempalace repair --mode legacy``.
+backup before mutating).
+
+Heavy fixers (full HNSW rebuild via :func:`mempalace.repair.rebuild_from_sqlite`)
+are gated behind the ``allow_heavy`` parameter. The detection probe still
+runs on every call so ``status`` surfaces degradation, but the applier is
+only queued when the caller explicitly opts in. The CLI exposes this
+through ``mempalace repair --mode hnsw-auto``; ordinary ``status`` calls
+leave ``allow_heavy=False`` and the operator sees a "detected" report
+with a pointer to the recovery command.
 
 Each fixer is:
 
 * **Detect-first.** A read-only probe decides whether to mutate. Probes
   must never raise on healthy state.
 * **Idempotent.** Running twice in a row is a no-op the second time.
-* **Bounded.** Each fixer touches a small, well-typed set of rows. No
-  full-table rewrites, no schema changes.
+* **Bounded** *unless* the fixer is explicitly marked heavy and the
+  caller passes ``allow_heavy=True``. Bounded fixers touch a small,
+  well-typed set of rows; heavy fixers may rewrite the whole vector
+  index and take tens of minutes.
 * **Self-reporting.** Returns a structured ``FixReport`` describing what
   it did so the caller can show the operator.
 
@@ -64,6 +73,7 @@ def auto_fix_palace(
     enabled: bool = True,
     backup: bool = True,
     apply: bool = True,
+    allow_heavy: bool = False,
 ) -> AutoFixSummary:
     """Run every safe auto-fix against ``palace_path``.
 
@@ -75,6 +85,13 @@ def auto_fix_palace(
             actually needs to write.
         apply: When False, run only the detection passes and report what
             would be fixed without mutating. Used by dry-run callers.
+        allow_heavy: Opt-in switch for fixers that violate the "bounded"
+            contract — currently the HNSW segment-writer rebuild, which
+            calls :func:`mempalace.repair.rebuild_from_sqlite` and can
+            take 30-60 minutes on a large palace. Detection still runs
+            with ``allow_heavy=False`` (so ``status`` shows the
+            degradation), but the applier is skipped and the operator is
+            pointed at ``mempalace repair --mode hnsw-auto``.
 
     Never raises. Fixer-specific failures are captured into the per-fix
     report so a single broken probe does not stop the others.
@@ -124,6 +141,30 @@ def auto_fix_palace(
         summary.reports.append(fs_report)
         if fs_report.detected and fs_applier is not None:
             pending.append((fs_report, fs_applier))
+
+    # Heavy probe: stuck HNSW segment writer (embeddings_queue accumulating
+    # ahead of every segment's applied max_seq_id). Detection is a cheap
+    # read-only SQLite query and runs on every autofix call so ``status``
+    # surfaces the degradation; the rebuild applier is only queued when
+    # the caller passes ``allow_heavy=True`` because the recovery path
+    # (``rebuild_from_sqlite``) re-embeds every drawer and takes 30-60
+    # minutes on a large palace.
+    heavy_report = FixReport(name="degraded_hnsw_writer")
+    try:
+        heavy_applier = _probe_degraded_hnsw_writer(palace_path, heavy_report)
+    except Exception as exc:  # noqa: BLE001
+        heavy_report.error = f"probe failed: {exc}"
+        logger.debug("autofix probe degraded_hnsw_writer failed", exc_info=True)
+        summary.reports.append(heavy_report)
+    else:
+        summary.reports.append(heavy_report)
+        if heavy_report.detected and heavy_applier is not None:
+            if allow_heavy:
+                pending.append((heavy_report, heavy_applier))
+            else:
+                heavy_report.detail += (
+                    " — run `mempalace repair --mode hnsw-auto` to rebuild"
+                )
 
     # Phase 2: backup + apply, only if any probe found work AND apply is on.
     if not pending or not apply:
@@ -403,6 +444,97 @@ def _probe_partial_hnsw_segments(palace_path: str, report: FixReport):
 
         moved = quarantine_partial_hnsw_segments(palace_path)
         report.rows_affected = len(moved)
+
+    return _apply
+
+
+# ---------------------------------------------------------------------------
+# Heavy fixers (gated behind ``allow_heavy=True``)
+# ---------------------------------------------------------------------------
+
+
+# Floor for the queue-vs-applied seq_id gap that triggers a "stuck writer"
+# detection. Real-world stuck-writer incidents leave gaps in the thousands
+# to tens of thousands (the writer panics mid-flush and never resumes, so
+# every subsequent ``add``/``upsert`` keeps appending to the queue while
+# ``max_seq_id`` stays frozen). Normal transient backlog between
+# compactor sweeps is well under this threshold, so picking a conservative
+# floor keeps false positives off the ``status`` report.
+_STUCK_WRITER_GAP_THRESHOLD = 1000
+
+
+def _probe_degraded_hnsw_writer(palace_path: str, report: FixReport):
+    """Detect a stuck HNSW segment writer (queue ahead of ``max_seq_id``).
+
+    On-disk fingerprint of the failure mode described in
+    :func:`mempalace.repair.rebuild_from_sqlite` — chromadb raises
+    ``InternalError: Failed to apply logs to the hnsw segment writer``
+    on every operation that touches the index. The queue keeps
+    accumulating new writes (``embeddings_queue.seq_id`` advances) while
+    none of the segments ever flush (``max_seq_id.seq_id`` stays at its
+    pre-failure value), so the gap between the two grows monotonically.
+
+    Detection is read-only against ``chroma.sqlite3``. The applier
+    delegates to :func:`mempalace.repair.rebuild_from_sqlite` with
+    ``archive_existing_dest=True`` — the existing palace is renamed to
+    ``<palace>.pre-rebuild-<timestamp>`` and a fresh one is rebuilt from
+    SQLite. This is the documented recovery path for this exact failure
+    mode (chromadb client cannot ``count()`` so ``rebuild_index`` cannot
+    recover; ``rebuild_from_sqlite`` bypasses the chromadb read path
+    entirely).
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        row = conn.execute("SELECT MAX(seq_id) FROM embeddings_queue").fetchone()
+        queue_max = row[0] if row else None
+        if queue_max is None:
+            # Nothing has ever been enqueued — no writer to be stuck.
+            return None
+        row = conn.execute("SELECT MAX(seq_id) FROM max_seq_id").fetchone()
+        applied_max = (row[0] if row else None) or 0
+
+    # ``max_seq_id`` columns can be BLOB on palaces touched by the
+    # legacy 0.6.x shim before the max-seq-id repair has run. Coerce
+    # both sides so the gap math doesn't TypeError; the poisoned-row
+    # probe earlier in the pipeline owns the BLOB → int repair.
+    def _coerce(val) -> int:
+        if isinstance(val, (bytes, bytearray)):
+            return int.from_bytes(val, "big")
+        return int(val)
+
+    try:
+        queue_max_i = _coerce(queue_max)
+        applied_max_i = _coerce(applied_max)
+    except (TypeError, ValueError):
+        return None
+
+    gap = queue_max_i - applied_max_i
+    if gap < _STUCK_WRITER_GAP_THRESHOLD:
+        return None
+
+    report.detected = True
+    report.rows_affected = gap
+    report.detail = (
+        f"embeddings_queue is {gap} entries ahead of applied max_seq_id "
+        f"({queue_max_i} vs {applied_max_i}); HNSW segment writer is likely "
+        "stuck"
+    )
+
+    def _apply():
+        # Imported lazily so ``mempalace.autofix`` keeps its minimal
+        # import surface — repair pulls in chromadb, embedding models,
+        # and the migration helpers, which we do not want loaded on
+        # every ``status`` call.
+        from .repair import rebuild_from_sqlite
+
+        rebuild_from_sqlite(
+            source_palace=palace_path,
+            dest_palace=palace_path,
+            archive_existing_dest=True,
+        )
 
     return _apply
 
