@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mempalace"
+dynamic = ["version"]
+description = "MemPalace fix branch — autofix + sqlite fallback layered on upstream 3.3.5."
+requires-python = ">=3.9"
+dependencies = [
+    "chromadb>=1.5.4,<2",
+    "pyyaml>=6.0,<7",
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.scripts]
+mempalace = "mempalace.cli:main"
+mempalace-mcp = "mempalace.mcp_server:main"
+
+[project.entry-points."mempalace.backends"]
+chroma = "mempalace.backends.chroma:ChromaBackend"
+
+[tool.hatch.version]
+path = "mempalace/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mempalace"]
