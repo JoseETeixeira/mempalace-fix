@@ -773,6 +773,55 @@ def cmd_repair(args):
         )
         return
 
+    if getattr(args, "mode", "legacy") == "hnsw-auto":
+        from .autofix import auto_fix_palace, render_summary
+
+        # Detection-only first pass so the operator sees the gap before
+        # consenting to a 30-60 min in-place rebuild. ``apply=False``
+        # keeps every applier skipped; the heavy probe still reports
+        # whether it would have run.
+        preview = auto_fix_palace(palace_path, apply=False, allow_heavy=True)
+        preview_lines = render_summary(preview)
+        for line in preview_lines:
+            print(line)
+
+        heavy = next(
+            (r for r in preview.reports if r.name == "degraded_hnsw_writer"),
+            None,
+        )
+        if heavy is None or not heavy.detected:
+            print(
+                "\n  No degraded HNSW writer detected — nothing to do."
+            )
+            return
+
+        # Same gate the from-sqlite path uses: the rebuild renames the
+        # existing palace dir aside, which the operator must consent to.
+        if not confirm_destructive_action(
+            "Rebuild via autofix (--mode hnsw-auto)",
+            palace_path,
+            assume_yes=getattr(args, "yes", False),
+        ):
+            return
+
+        result = auto_fix_palace(
+            palace_path,
+            apply=True,
+            backup=getattr(args, "backup", True),
+            allow_heavy=True,
+        )
+        for line in render_summary(result):
+            print(line)
+        # Non-zero exit when the heavy applier raised, so unattended
+        # callers (CI, cron) can detect a partial recovery.
+        heavy_after = next(
+            (r for r in result.reports if r.name == "degraded_hnsw_writer"),
+            None,
+        )
+        if heavy_after is not None and heavy_after.error:
+            sys.exit(1)
+        return
+
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from .migrate import confirm_destructive_action
         from .repair import RebuildPartialError, rebuild_from_sqlite
@@ -1422,14 +1471,17 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id", "from-sqlite"],
+        choices=["legacy", "max-seq-id", "from-sqlite", "hnsw-auto"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild via the chromadb client (default). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
-            "chromadb client cannot open the collection."
+            "chromadb client cannot open the collection. "
+            "hnsw-auto: run the autofix degraded-HNSW-writer probe and, if "
+            "detected, rebuild via from-sqlite. Use when status reports a "
+            "stuck segment writer (queue ahead of max_seq_id)."
         ),
     )
     p_repair.add_argument(
