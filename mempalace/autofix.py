@@ -142,21 +142,33 @@ def auto_fix_palace(
         if fs_report.detected and fs_applier is not None:
             pending.append((fs_report, fs_applier))
 
-    # Heavy probe: stuck HNSW segment writer (embeddings_queue accumulating
-    # ahead of every segment's applied max_seq_id). Detection is a cheap
-    # read-only SQLite query and runs on every autofix call so ``status``
-    # surfaces the degradation; the rebuild applier is only queued when
-    # the caller passes ``allow_heavy=True`` because the recovery path
-    # (``rebuild_from_sqlite``) re-embeds every drawer and takes 30-60
+    # Heavy probes: two on-disk fingerprints that both recover via
+    # ``rebuild_from_sqlite``. Detection is read-only and runs on every
+    # autofix call so ``status`` surfaces the degradation; the rebuild
+    # applier is only queued when the caller passes ``allow_heavy=True``
+    # because the recovery path re-embeds every drawer and takes 30-60
     # minutes on a large palace.
-    heavy_report = FixReport(name="degraded_hnsw_writer")
-    try:
-        heavy_applier = _probe_degraded_hnsw_writer(palace_path, heavy_report)
-    except Exception as exc:  # noqa: BLE001
-        heavy_report.error = f"probe failed: {exc}"
-        logger.debug("autofix probe degraded_hnsw_writer failed", exc_info=True)
-        summary.reports.append(heavy_report)
-    else:
+    #
+    # 1. ``degraded_hnsw_writer`` — embeddings_queue accumulating ahead of
+    #    every segment's applied max_seq_id (writer panicked mid-flush).
+    # 2. ``diverged_hnsw_index`` — HNSW pickle reports fewer elements than
+    #    chroma.sqlite3.embeddings holds. Queue can be fully drained,
+    #    max_seq_id can be current — the segment files themselves just
+    #    don't contain the rows. Happens after partial-segment quarantine,
+    #    after a crash mid-flush, or from the #1222 max_elements freeze.
+    heavy_probes = (
+        ("degraded_hnsw_writer", _probe_degraded_hnsw_writer),
+        ("diverged_hnsw_index", _probe_diverged_hnsw_index),
+    )
+    for probe_name, probe in heavy_probes:
+        heavy_report = FixReport(name=probe_name)
+        try:
+            heavy_applier = probe(palace_path, heavy_report)
+        except Exception as exc:  # noqa: BLE001
+            heavy_report.error = f"probe failed: {exc}"
+            logger.debug("autofix probe %s failed", probe_name, exc_info=True)
+            summary.reports.append(heavy_report)
+            continue
         summary.reports.append(heavy_report)
         if heavy_report.detected and heavy_applier is not None:
             if allow_heavy:
@@ -528,6 +540,100 @@ def _probe_degraded_hnsw_writer(palace_path: str, report: FixReport):
         # import surface — repair pulls in chromadb, embedding models,
         # and the migration helpers, which we do not want loaded on
         # every ``status`` call.
+        from .repair import rebuild_from_sqlite
+
+        rebuild_from_sqlite(
+            source_palace=palace_path,
+            dest_palace=palace_path,
+            archive_existing_dest=True,
+        )
+
+    return _apply
+
+
+def _probe_diverged_hnsw_index(palace_path: str, report: FixReport):
+    """Detect silent HNSW divergence — pickle holds fewer elements than sqlite.
+
+    Different on-disk fingerprint from :func:`_probe_degraded_hnsw_writer`:
+    the embeddings_queue may be fully drained and ``max_seq_id`` may be
+    current, but the HNSW segment files themselves contain only a fraction
+    of the rows present in ``chroma.sqlite3.embeddings``. The
+    ``hnsw_capacity_status`` probe (already used by ``status`` and
+    ``repair-status``) detects this and flips ``vector_disabled`` so MCP
+    falls back to BM25, but until now nothing wired that signal into the
+    autofix queue. Symptom report: status shows
+    ``vector_disabled_reason: HNSW index holds N elements but sqlite has M
+    embeddings`` and ``mempalace repair --mode hnsw-auto`` exits with
+    "No degraded HNSW writer detected — nothing to do."
+
+    Checks both first-class collections (drawers + closets). Recovery is
+    the same ``rebuild_from_sqlite`` path used for the stuck-writer
+    fingerprint — one rebuild repopulates every collection.
+    """
+    # Lazy import: hnsw_capacity_status lives in backends.chroma which
+    # is happy to load (no chromadb client open here, just sqlite + a
+    # pickle read), but keeping the import local matches the rest of
+    # the heavy-probe pattern.
+    try:
+        from .backends.chroma import hnsw_capacity_status
+        from .repair import CLOSETS_COLLECTION_NAME
+    except Exception as exc:  # noqa: BLE001
+        report.error = f"probe import failed: {exc}"
+        return None
+
+    # ``_drawers_collection_name`` is the runtime drawer collection
+    # name; pulling it through repair keeps the source of truth in one
+    # place even if a future migration renames the collection.
+    try:
+        from .repair import _drawers_collection_name
+
+        drawers_name = _drawers_collection_name()
+    except Exception:  # noqa: BLE001
+        # Fallback to the chroma default; ``hnsw_capacity_status`` uses
+        # the same default in its signature so the probe still works.
+        drawers_name = "mempalace_drawers"
+
+    diverged: list[tuple[str, dict]] = []
+    for collection_name in (drawers_name, CLOSETS_COLLECTION_NAME):
+        try:
+            status = hnsw_capacity_status(palace_path, collection_name)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "hnsw_capacity_status raised for %s", collection_name, exc_info=True
+            )
+            continue
+        if status.get("diverged"):
+            diverged.append((collection_name, status))
+
+    if not diverged:
+        return None
+
+    # Build a compact, multi-collection detail string. The single-line
+    # detail is what ``render_summary`` prints under the autofix banner.
+    pieces: list[str] = []
+    worst_gap = 0
+    for name, status in diverged:
+        sqlite_count = status.get("sqlite_count") or 0
+        hnsw_count = status.get("hnsw_count") or 0
+        gap = (status.get("divergence") or 0)
+        worst_gap = max(worst_gap, gap)
+        pct = 100.0 * gap / max(sqlite_count, 1) if sqlite_count else 0.0
+        pieces.append(
+            f"{name}: HNSW {hnsw_count:,} / sqlite {sqlite_count:,} "
+            f"({gap:,} drawers, {pct:.0f}% missing)"
+        )
+
+    report.detected = True
+    report.rows_affected = worst_gap
+    report.detail = "; ".join(pieces)
+
+    def _apply():
+        # Same applier as the stuck-writer probe. ``rebuild_from_sqlite``
+        # repopulates every recoverable collection in one pass, so one
+        # call covers both drawers + closets even when only one is
+        # diverged. ``archive_existing_dest=True`` preserves the corrupt
+        # palace at ``<palace>.pre-rebuild-<timestamp>`` so the operator
+        # can roll back if the rebuild itself misbehaves.
         from .repair import rebuild_from_sqlite
 
         rebuild_from_sqlite(

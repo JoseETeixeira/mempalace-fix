@@ -1287,8 +1287,11 @@ def status(palace_path: str):
     Runs :func:`mempalace.autofix.auto_fix_palace` first so safe, known
     palace-state problems (orphaned queue rows, orphaned max_seq_id rows,
     poisoned max_seq_id rows from the 0.6.x BLOB shim) are repaired in
-    place before the count. Heavy operations (full HNSW reindex) are not
-    auto-triggered — those still need ``mempalace repair --mode legacy``.
+    place before the count. Heavy operations (full HNSW reindex) are
+    detected and surfaced with a "detected" badge — for both stuck-writer
+    and silent-index-divergence fingerprints — but the rebuild applier is
+    gated behind ``mempalace repair --mode hnsw-auto`` so a 30-60 min
+    in-place rebuild never fires unattended.
     """
     try:
         from .autofix import auto_fix_palace, render_summary
