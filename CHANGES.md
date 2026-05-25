@@ -209,3 +209,214 @@ python3 -m mempalace repair-status # already worked; still works
 Layer2 with `where={"wing": "freighthero"}` and `$and` filters return
 correct rows. Healthy closets collection still uses `ChromaCollection`
 (verified via type assertion).
+
+# mempalace fix: autofix surfaces stuck HNSW segment writer + opt-in rebuild
+
+## Failure observed
+
+```
+$ mempalace diary write ...
+InternalError: Failed to apply logs to the hnsw segment writer
+$ mempalace add-drawer ...
+InternalError: Failed to apply logs to the hnsw segment writer
+```
+
+The chromadb embeddings_queue keeps advancing (`seq_id` grows on every
+new write) but every segment's `max_seq_id.seq_id` is frozen at its
+pre-failure value, so the gap between the two grows monotonically.
+`status` continued to look healthy because the existing autofix probes
+(`orphaned_queue_rows`, `orphaned_max_seq_id_rows`, `poisoned_max_seq_id`,
+`partial_hnsw_segments`) all check different shapes of corruption.
+
+The recovery path already existed (`mempalace repair --mode from-sqlite`,
+catalogued in `repair.py:1024`) but the operator had to know to run it.
+
+## Fix
+
+Add a "degraded HNSW writer" detector to autofix that compares
+`embeddings_queue.MAX(seq_id)` against `max_seq_id.MAX(seq_id)` and
+flags the gap when it crosses a 1000-row floor. Detection is read-only
+and runs on every autofix call so `status` surfaces the degradation.
+The applier is gated behind a new `allow_heavy=True` parameter because
+the recovery action (`rebuild_from_sqlite`) re-embeds every drawer and
+takes 30-60 minutes on a large palace — not safe to run silently from
+`status`.
+
+A new CLI mode `mempalace repair --mode hnsw-auto` opts into the
+applier. It runs the probe in dry-run first, prints what would be
+rebuilt, gates on `confirm_destructive_action` (same prompt
+`from-sqlite` uses), then calls `auto_fix_palace(allow_heavy=True)`.
+
+### Files
+
+- **MODIFIED** `mempalace/autofix.py`
+  - Module docstring updated: bounded contract now reads "*unless* the
+    fixer is explicitly marked heavy and the caller passes
+    `allow_heavy=True`."
+  - `auto_fix_palace` gains an `allow_heavy: bool = False` parameter.
+    Default preserves the existing `status`/`miner` invocation
+    semantics (no behavior change for current callers).
+  - `_probe_degraded_hnsw_writer` — new filesystem/SQLite probe. Reads
+    `MAX(seq_id)` from `embeddings_queue` and `max_seq_id` via a
+    read-only sqlite URI, coerces BLOB seq_ids (for palaces touched by
+    the legacy 0.6.x shim before the poisoned-max-seq-id repair has
+    run), bails on healthy gap / missing queue / missing
+    `chroma.sqlite3`. Applier lazily imports
+    `repair.rebuild_from_sqlite` so `status` calls don't pull in
+    chromadb just to run the probe.
+  - New probe block wired into `auto_fix_palace` after
+    `partial_hnsw_segments`. Probe always appends a report; applier is
+    only added to `pending` when `allow_heavy=True`. When detected but
+    not allowed, the report's `detail` is suffixed with the recovery
+    command hint so the operator sees it in `status` output.
+
+- **MODIFIED** `mempalace/cli.py`
+  - `--mode` choices for `mempalace repair` extended with `hnsw-auto`.
+    Help text describes the trigger (stuck segment writer reported by
+    `status`).
+  - `cmd_repair` dispatch branch for `hnsw-auto`:
+    1. Run `auto_fix_palace(palace_path, apply=False, allow_heavy=True)`
+       to preview the probe result.
+    2. If `degraded_hnsw_writer` not detected, print "Nothing to do" and
+       return.
+    3. Else gate on `confirm_destructive_action` (mirrors `from-sqlite`).
+    4. Run `auto_fix_palace(palace_path, apply=True, allow_heavy=True)`
+       and render the summary.
+    5. Exit non-zero if the heavy applier captured an error so
+       unattended callers (CI, cron) can detect partial recovery.
+
+### Behavior after fix
+
+- `mempalace status` → existing autofix output gains a
+  `[detected] degraded_hnsw_writer: embeddings_queue is N entries
+  ahead of applied max_seq_id (...) — run `mempalace repair --mode
+  hnsw-auto` to rebuild` line when the gap exceeds 1000. No silent
+  rebuild — `status` keeps its fast/bounded contract.
+- `mempalace repair --mode hnsw-auto` → previews the gap, prompts for
+  confirmation, then archives the existing palace dir to
+  `<palace>.pre-rebuild-<timestamp>` and rebuilds from sqlite via the
+  documented `rebuild_from_sqlite` recovery path.
+- Healthy palaces (gap < 1000) → no detection, no behavior change.
+- Existing autofix callers (`miner.status`, anything passing only
+  `palace_path`) → unchanged because `allow_heavy` defaults to `False`.
+
+### Tests run
+
+In-tree smoke tests against a stub SQLite that mirrors the chromadb
+schema autofix touches:
+
+```
+healthy gap=10                       → applier=None, detected=False
+stuck gap=5010                       → detected=True, rows=5010, applier present
+empty embeddings_queue               → applier=None, detected=False
+allow_heavy=False (default)          → detected=True, applied=False
+                                       detail suffixed with recovery command
+allow_heavy=True + apply=False       → detected=True, applied=False (dry-run)
+allow_heavy=True + apply=True        → applier runs; rebuild_from_sqlite errors
+                                       on the stub schema are captured into
+                                       report.error (auto_fix_palace contract
+                                       "never raises" preserved)
+```
+
+# mempalace fix: autofix also detects silent HNSW index divergence
+
+## Failure observed
+
+```
+$ mempalace repair-status
+  [drawers]
+    sqlite count:   274,199
+    hnsw count:     27,121
+    divergence:     247,078
+    status:         DIVERGED
+    note:           HNSW index holds 27,121 elements but sqlite has
+                    274,199 embeddings — 247,078 drawers (90%) are
+                    invisible to vector search. Run `mempalace repair`
+                    to rebuild.
+$ mempalace repair --mode hnsw-auto
+  No degraded HNSW writer detected — nothing to do.
+```
+
+`mempalace_status` (MCP) returns `vector_disabled: true` with the same
+divergence message, so callers correctly fall back to BM25 — but the
+"auto" repair mode that exists for exactly this kind of recovery
+refuses to act because the on-disk fingerprint is different from the
+stuck-writer shape.
+
+## Root cause
+
+`_probe_degraded_hnsw_writer` only checks one shape: the
+`embeddings_queue.MAX(seq_id) >> max_seq_id.MAX(seq_id)` gap that
+appears when the segment writer panics mid-flush. The other recovery-
+eligible shape — HNSW segment files containing fewer elements than
+`chroma.sqlite3.embeddings` even with a fully-drained queue — has its
+own detector (`backends/chroma.py::hnsw_capacity_status`, used by
+`status` and `repair-status` to set `vector_disabled`) but the signal
+never made it into the autofix queue. Operators had to know to switch
+modes manually (`--mode from-sqlite --archive-existing`).
+
+## Fix
+
+Add `_probe_diverged_hnsw_index` to `mempalace/autofix.py` and wire it
+into the same heavy-probe loop as the stuck-writer probe. The new probe
+calls `hnsw_capacity_status` for both first-class collections (drawers
++ closets) and reports detection when either flips to `diverged`. The
+applier is the same `rebuild_from_sqlite(archive_existing_dest=True)`
+used for the stuck-writer fix — one rebuild covers every recoverable
+collection in a single pass.
+
+The `--mode hnsw-auto` CLI branch now treats both probes as recovery-
+eligible: it gates on any detected heavy report, runs the same
+`confirm_destructive_action` prompt, and exits non-zero if any heavy
+applier captures an error.
+
+### Files
+
+- **MODIFIED** `mempalace/autofix.py`
+  - The single `degraded_hnsw_writer` block is generalized into a
+    `heavy_probes` tuple so adding a third heavy probe in the future is
+    a one-line change. Per-probe `try`/`except` semantics preserved.
+  - `_probe_diverged_hnsw_index` — new heavy probe. Lazy-imports
+    `hnsw_capacity_status` and `CLOSETS_COLLECTION_NAME` to keep
+    `autofix`'s import surface minimal on healthy-path calls. Reports
+    `detected=True` when either collection's HNSW count trails its
+    sqlite count past the threshold `hnsw_capacity_status` already
+    enforces. Detail line lists each diverged collection so the
+    operator sees which one (or both) is affected. Applier delegates to
+    `repair.rebuild_from_sqlite` with `archive_existing_dest=True`.
+
+- **MODIFIED** `mempalace/cli.py`
+  - `--mode hnsw-auto` dispatch branch checks any report in
+    `HEAVY_PROBE_NAMES = ("degraded_hnsw_writer", "diverged_hnsw_index")`
+    instead of the single `degraded_hnsw_writer` name. "Nothing to do"
+    message updated to mention both shapes. Non-zero exit on error
+    extended the same way.
+  - `--mode` argparse help text updated to mention the silent-
+    divergence shape so `--help` reflects the broader trigger.
+
+- **MODIFIED** `mempalace/miner.py`
+  - `status` docstring updated to note that heavy operations are now
+    detected for both fingerprints (stuck writer + index divergence)
+    while preserving the no-silent-rebuild contract.
+
+### Behavior after fix
+
+- `mempalace status` / `mempalace_status` (MCP) → autofix output now
+  also shows
+  `[detected] diverged_hnsw_index: mempalace_drawers: HNSW N / sqlite M
+  (K drawers, P% missing) — run \`mempalace repair --mode hnsw-auto\` to
+  rebuild` whenever `hnsw_capacity_status` flips a collection to
+  diverged. Vector search continues to fall back to BM25 (existing
+  behavior) — the new line just makes the recovery command discoverable
+  from the same place the divergence is reported.
+- `mempalace repair --mode hnsw-auto` → fires on either stuck writer or
+  silent divergence (or both). Same archive-then-rebuild flow. Operators
+  no longer need to remember to switch to `--mode from-sqlite
+  --archive-existing` when the writer is healthy but the index is
+  silently undersized.
+- Healthy palaces (both probes report no divergence) → message reads
+  "No degraded HNSW writer or index divergence detected — nothing to
+  do." No behavior change.
+- Existing autofix callers (`miner.status`, anything passing only
+  `palace_path`) → unchanged because `allow_heavy` still defaults to
+  `False`. Detection is surfaced; rebuild is never auto-triggered.

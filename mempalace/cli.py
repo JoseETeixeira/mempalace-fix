@@ -776,22 +776,28 @@ def cmd_repair(args):
     if getattr(args, "mode", "legacy") == "hnsw-auto":
         from .autofix import auto_fix_palace, render_summary
 
+        # Two recovery-eligible probes share this entry point. Both
+        # rebuild via ``rebuild_from_sqlite``; the operator does not
+        # need to know which on-disk shape triggered.
+        HEAVY_PROBE_NAMES = ("degraded_hnsw_writer", "diverged_hnsw_index")
+
         # Detection-only first pass so the operator sees the gap before
         # consenting to a 30-60 min in-place rebuild. ``apply=False``
-        # keeps every applier skipped; the heavy probe still reports
-        # whether it would have run.
+        # keeps every applier skipped; the heavy probes still report
+        # whether they would have run.
         preview = auto_fix_palace(palace_path, apply=False, allow_heavy=True)
         preview_lines = render_summary(preview)
         for line in preview_lines:
             print(line)
 
-        heavy = next(
-            (r for r in preview.reports if r.name == "degraded_hnsw_writer"),
-            None,
-        )
-        if heavy is None or not heavy.detected:
+        heavy_detected = [
+            r for r in preview.reports
+            if r.name in HEAVY_PROBE_NAMES and r.detected
+        ]
+        if not heavy_detected:
             print(
-                "\n  No degraded HNSW writer detected — nothing to do."
+                "\n  No degraded HNSW writer or index divergence detected — "
+                "nothing to do."
             )
             return
 
@@ -812,13 +818,13 @@ def cmd_repair(args):
         )
         for line in render_summary(result):
             print(line)
-        # Non-zero exit when the heavy applier raised, so unattended
+        # Non-zero exit when any heavy applier raised, so unattended
         # callers (CI, cron) can detect a partial recovery.
-        heavy_after = next(
-            (r for r in result.reports if r.name == "degraded_hnsw_writer"),
-            None,
-        )
-        if heavy_after is not None and heavy_after.error:
+        heavy_errors = [
+            r for r in result.reports
+            if r.name in HEAVY_PROBE_NAMES and r.error
+        ]
+        if heavy_errors:
             sys.exit(1)
         return
 
@@ -1479,9 +1485,11 @@ def main():
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
             "chromadb client cannot open the collection. "
-            "hnsw-auto: run the autofix degraded-HNSW-writer probe and, if "
-            "detected, rebuild via from-sqlite. Use when status reports a "
-            "stuck segment writer (queue ahead of max_seq_id)."
+            "hnsw-auto: run the autofix heavy probes (degraded-HNSW-writer "
+            "and silent-HNSW-index-divergence) and, if either fires, rebuild "
+            "via from-sqlite. Use when status reports a stuck segment writer "
+            "(queue ahead of max_seq_id) or vector_disabled with HNSW count "
+            "below sqlite embeddings."
         ),
     )
     p_repair.add_argument(
